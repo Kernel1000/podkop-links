@@ -17,9 +17,24 @@ NAME="${E_NAME:-$NAME}" GH_REPO="${E_REPO:-${GH_REPO:-${CODE_REPO%%/*}/router-li
 
 uci -q get podkop.main >/dev/null || die "podkop не найден (нет секции podkop.main)"
 
+# версия podkop — для информации; режим должен быть urltest, иначе ссылки запишутся «мимо»
+ver=$( (apk list -I 2>/dev/null; opkg list-installed 2>/dev/null) \
+       | sed -n 's/^podkop - \([^ ]*\).*/podkop \1/p; s/^podkop-\([0-9][^ ]*\) .*/podkop \1/p' | head -n1 )
+mode=$(uci -q get podkop.main.proxy_config_type)
+echo "==> ${ver:-podkop (версия не определена)}, режим: ${mode:-не задан}"
+if [ "$mode" != urltest ]; then
+  die "podkop работает не в режиме urltest, а скрипт пишет ссылки именно туда (urltest_proxy_links).
+   Переключи в LuCI: Services → Podkop → тип конфигурации прокси → URLTest и запусти установку снова.
+   Если такого пункта нет — podkop слишком старый, сначала обнови его."
+fi
+
 if ! command -v curl >/dev/null; then
   echo "==> Ставлю curl"
-  { opkg update && opkg install curl; } >/dev/null 2>&1 || apk add curl >/dev/null 2>&1 || die "Не удалось поставить curl"
+  if command -v apk >/dev/null; then
+    { apk update && apk add curl; } >/dev/null 2>&1 || die "Не удалось поставить curl (apk)"
+  else
+    { opkg update && opkg install curl; } >/dev/null 2>&1 || die "Не удалось поставить curl (opkg)"
+  fi
 fi
 
 echo "==> Скачиваю podkop-links-sync"

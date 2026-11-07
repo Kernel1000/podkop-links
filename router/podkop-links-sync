@@ -17,6 +17,9 @@ TMP=/tmp/podkop-links.txt
 
 log() { logger -t podkop-links "$*"; if [ -t 1 ]; then echo "$*"; fi; }
 
+MODE=$(uci -q get "podkop.$SECTION.proxy_config_type")
+[ "$MODE" = urltest ] || { log "podkop не в режиме urltest (сейчас: ${MODE:-не задан}) — ссылки не трогаю"; exit 1; }
+
 LOCK=/tmp/podkop-links-sync.lock
 mkdir "$LOCK" 2>/dev/null || exit 0
 trap 'rmdir "$LOCK"; rm -f "$TMP"' EXIT INT TERM
