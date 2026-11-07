@@ -49,10 +49,17 @@ ask() { # ask <вопрос> <по умолчанию>
 if [ -z "$E_NAME" ] || [ -z "$GH_TOKEN" ]; then
   cur=$(uci -q get podkop.main.urltest_proxy_links)
   [ -n "$cur" ] && { echo "Сейчас в podkop:"; for l in $cur; do echo "  #${l##*#}"; done; }
-  NAME=$(ask "Имя роутера (Email клиента в 3x-ui, одинаковый на обоих серверах)" "$NAME")
+  while :; do
+    NAME=$(ask "Имя роутера (Email клиента в 3x-ui, одинаковый на всех серверах)" "$NAME")
+    [ -n "$NAME" ] && break; echo "Имя не может быть пустым" >/dev/tty
+  done
   GH_REPO=$(ask "GitHub-репозиторий со ссылками" "$GH_REPO")
-  t=$(ask "GitHub-токен только на чтение (Enter — оставить текущий)" "")
-  [ -n "$t" ] && GH_TOKEN="$t"
+  while :; do
+    if [ -n "$GH_TOKEN" ]; then t=$(ask "GitHub-токен только на чтение (Enter — оставить сохранённый)" "")
+    else t=$(ask "GitHub-токен только на чтение" ""); fi
+    [ -n "$t" ] && GH_TOKEN="$t"
+    [ -n "$GH_TOKEN" ] && break; echo "Токен не может быть пустым" >/dev/tty
+  done
 fi
 [ -n "$NAME" ] && [ -n "$GH_TOKEN" ] || die "Нужны имя роутера и токен"
 
