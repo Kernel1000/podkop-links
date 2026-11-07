@@ -1,0 +1,69 @@
+#!/bin/sh
+# podkop-links-sync — забирает ссылки этого роутера из GitHub (routers/<NAME>.txt) и обновляет podkop.
+#   podkop-links-sync          обновить, если в репозитории был новый коммит
+#   podkop-links-sync --force  скачать и сверить, даже если коммит не менялся
+#   podkop-links-sync --dry    только показать, что получено
+# Настройки: /etc/podkop-links.conf (NAME, GH_REPO, GH_TOKEN[, SECTION])
+
+CONF=/etc/podkop-links.conf
+# shellcheck disable=SC1090
+. "$CONF" 2>/dev/null || { echo "Нет $CONF — запусти установщик"; exit 1; }
+SECTION="${SECTION:-main}"
+OPT="podkop.$SECTION.urltest_proxy_links"
+DRY="" FORCE=""
+for a in "$@"; do case "$a" in --dry) DRY=1 ;; --force) FORCE=1 ;; esac; done
+STAMP=/tmp/podkop-links.sha   # в RAM: флеш не изнашивается, после перезагрузки — одна полная проверка
+TMP=/tmp/podkop-links.txt
+
+log() { logger -t podkop-links "$*"; if [ -t 1 ]; then echo "$*"; fi; }
+
+LOCK=/tmp/podkop-links-sync.lock
+mkdir "$LOCK" 2>/dev/null || exit 0
+trap 'rmdir "$LOCK"; rm -f "$TMP"' EXIT INT TERM
+
+api() { # api <Accept> <путь> [доп. аргументы curl]
+  a=$1 p=$2; shift 2
+  curl -sS --max-time 20 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: $a" "$@" \
+    "https://api.github.com/repos/$GH_REPO/$p"
+}
+
+# 1) Дешёвая проверка: номер последнего коммита. Не изменился — выходим.
+HEAD=$(api application/vnd.github.sha commits/HEAD -f) || { log "GitHub недоступен, оставляю как есть"; exit 1; }
+case "$HEAD" in *[!0-9a-f]*|"") log "GitHub вернул странный ответ, оставляю как есть"; exit 1 ;; esac
+if [ -z "$DRY$FORCE" ] && [ "$HEAD" = "$(cat "$STAMP" 2>/dev/null)" ]; then
+  [ -t 1 ] && echo "В репозитории ничего нового"
+  exit 0
+fi
+
+# 2) Был новый коммит — качаем свой файл
+code=$(api application/vnd.github.raw "contents/routers/$NAME.txt" -o "$TMP" -w '%{http_code}')
+case "$code" in
+  200) ;;
+  404) log "в репозитории нет файла для «$NAME», оставляю как есть"; echo "$HEAD" > "$STAMP"; exit 0 ;;
+  *)   log "GitHub ответил ${code:-ошибкой}, оставляю как есть"; exit 1 ;;
+esac
+
+NEW=$(grep -E '^vless://[^[:space:]]+@[^[:space:]]+$' "$TMP" | tr '\n' ' ' | sed 's/ $//')
+CUR=$(uci -q get "$OPT")
+
+if [ -n "$DRY" ]; then
+  show() { for l in "$@"; do echo "  ${l%%\?*}  #${l##*#}"; done | sed 's#vless://[^@]*@#vless://***@#'; }
+  # shellcheck disable=SC2086
+  { echo "Сейчас в podkop:"; show $CUR; echo "Из GitHub для «$NAME»:"; show $NEW; }
+  if [ "$NEW" = "$CUR" ]; then echo "→ без изменений"; else echo "→ будет обновлено"; fi
+  exit 0
+fi
+
+[ -n "$NEW" ] || { log "в файле «$NAME» нет ссылок — ничего не меняю"; exit 1; }
+if [ "$NEW" = "$CUR" ]; then
+  echo "$HEAD" > "$STAMP"
+  [ -t 1 ] && echo "Ссылки этого роутера не изменились"
+  exit 0
+fi
+
+uci -q delete "$OPT"
+for l in $NEW; do uci add_list "$OPT=$l"; done
+uci commit podkop
+/etc/init.d/podkop restart >/dev/null 2>&1
+echo "$HEAD" > "$STAMP"
+log "ссылки обновлены ($(echo "$NEW" | wc -w) шт.), podkop перезапущен"
