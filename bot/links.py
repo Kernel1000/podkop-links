@@ -26,11 +26,11 @@ def parse_xui_db(path: str, addr: str, slot: int) -> tuple[dict[str, str], list[
     links, skipped = {}, []
     db = sqlite3.connect(path)
     try:
-        rows = db.execute("select port, settings, stream_settings from inbounds "
+        rows = db.execute("select port, settings, stream_settings, remark from inbounds "
                           "where protocol='vless' and enable=1").fetchall()
     finally:
         db.close()
-    for port, settings, stream in rows:
+    for port, settings, stream, remark in rows:
         s = json.loads(stream or "{}")
         if s.get("security") != "reality" or s.get("network", "tcp") != "tcp":
             continue
@@ -56,7 +56,9 @@ def parse_xui_db(path: str, addr: str, slot: int) -> tuple[dict[str, str], list[
                 ("type", "tcp"),
             ]
             qs = "&".join(f"{k}={_q(v)}" for k, v in params)
-            links[email] = f"vless://{c['id']}@{host}:{port}?{qs}#{_q(f'slot{slot}-{email}')}"
+            # метка как у 3x-ui: «название inbound-Email» (например vlessDE-mama_home_router)
+            label = f"{(remark or '').strip() or f'slot{slot}'}-{email}"
+            links[email] = f"vless://{c['id']}@{host}:{port}?{qs}#{_q(label)}"
     return links, skipped
 
 
@@ -94,9 +96,31 @@ async def collect() -> Collected:
 
 # ---------- план изменений ----------
 
-def _slot_of(link: str) -> int | None:
-    m = re.search(r"#slot(\d+)-", link)
-    return int(m.group(1)) if m else None
+SLOT_LINE = re.compile(r"^#\s*slot\s*(\d+)\s*$", re.I)
+
+
+def parse_file(lines: list[str]) -> dict[int, str]:
+    """Файл роутера -> {слот: ссылка}. Слот задаёт строка «# slot N» перед ссылкой;
+    в старом формате (без таких строк) — метка #slotN- в самой ссылке."""
+    out, cur = {}, None
+    for ln in lines:
+        if m := SLOT_LINE.match(ln):
+            cur = int(m.group(1))
+        elif ln.startswith("vless://"):
+            s = cur
+            if s is None and (m := re.search(r"#slot(\d+)-", ln)):
+                s = int(m.group(1))
+            if s is not None:
+                out.setdefault(s, ln)
+            cur = None
+    return out
+
+
+def render_file(by_slot: dict[int, str]) -> list[str]:
+    lines = []
+    for s in sorted(by_slot):
+        lines += [f"# slot {s}", by_slot[s]]
+    return lines
 
 
 @dataclass
@@ -122,11 +146,7 @@ def make_plan(col: Collected, old: dict[str, list[str]], legacy: list[str] = ())
     now = {n for links in col.per_slot.values() for n in links}
 
     for name in sorted(now | set(old)):
-        old_by_slot = {}
-        for ln in old.get(name, []):
-            s = _slot_of(ln)
-            if s is not None:
-                old_by_slot.setdefault(s, ln)
+        old_by_slot = parse_file(old.get(name, []))
         present = name in now
         if not present and col.failed and old.get(name):
             # роутера нет на доступных серверах, но часть серверов не ответила — не трогаем
@@ -137,24 +157,24 @@ def make_plan(col: Collected, old: dict[str, list[str]], legacy: list[str] = ())
             plan.files[f"{DIR}/{name}.txt"] = None
             continue
 
-        lines, kept = [], []
+        new_by_slot, kept = {}, []
         for s in slots:
             if s in col.per_slot and name in col.per_slot[s]:
-                lines.append(col.per_slot[s][name])
+                new_by_slot[s] = col.per_slot[s][name]
             elif s in old_by_slot:  # сервер недоступен или на нём нет роутера — оставляем прежнюю ссылку
-                lines.append(old_by_slot[s])
+                new_by_slot[s] = old_by_slot[s]
                 kept.append(s)
             if s in col.per_slot and name not in col.per_slot[s]:
                 plan.missing.setdefault(s, []).append(name)
         plan.total += 1
         if kept:
             plan.kept[name] = kept
+        lines = render_file(new_by_slot)
         if name not in old:
             plan.added.append(name)
         elif lines != old[name]:
-            new_by_slot = {_slot_of(ln): ln for ln in lines}
             plan.changed[name] = sorted(s for s in set(new_by_slot) | set(old_by_slot)
-                                        if new_by_slot.get(s) != old_by_slot.get(s) and s is not None)
+                                        if new_by_slot.get(s) != old_by_slot.get(s))
         else:
             continue
         plan.files[f"{DIR}/{name}.txt"] = "\n".join(lines) + "\n"
@@ -183,7 +203,7 @@ def plan_text(col: Collected, plan: Plan) -> str:
     if plan.added:
         out += [f"  + {e(n)}" for n in plan.added]
     if plan.changed:
-        out += [f"  ~ {e(n)} (слот {', '.join(map(str, sl)) or '—'})" for n, sl in plan.changed.items()]
+        out += [f"  ~ {e(n)} ({'слот ' + ', '.join(map(str, sl)) if sl else 'формат файла'})" for n, sl in plan.changed.items()]
     if plan.removed:
         out += [f"  − {e(n)} (нет ни на одном сервере)" for n in plan.removed]
     if plan.legacy:
