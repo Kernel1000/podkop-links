@@ -45,6 +45,11 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/Kernel1000/podkop-links/ma
 
 Нужен отдельный GitHub-токен **только на чтение** (Contents: Read-only) для приватного репозитория со ссылками.
 
+Режим podkop:
+* `urltest` — ставится как есть;
+* одна ссылка (`url`) — установщик переключит на urltest, но только после того, как получит ссылки из GitHub (старая ссылка остаётся в `proxy_string` для отката);
+* VPN-интерфейс, `outbound`/`selector` или podkop без urltest — установка останавливается, на роутере ничего не меняется.
+
 * Раз в 10 минут роутер проверяет только номер последнего коммита; свой файл качает, лишь когда он сменился
 * Проверить: `podkop-links-sync --dry`, принудительно: `podkop-links-sync --force`
 * Лог: `logread -e podkop-links`

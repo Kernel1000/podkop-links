@@ -17,16 +17,9 @@ NAME="${E_NAME:-$NAME}" GH_REPO="${E_REPO:-${GH_REPO:-${CODE_REPO%%/*}/router-li
 
 uci -q get podkop.main >/dev/null || die "podkop не найден (нет секции podkop.main)"
 
-# версия podkop — для информации; режим должен быть urltest, иначе ссылки запишутся «мимо»
 ver=$( (apk list -I 2>/dev/null; opkg list-installed 2>/dev/null) \
        | sed -n 's/^podkop - \([^ ]*\).*/podkop \1/p; s/^podkop-\([0-9][^ ]*\) .*/podkop \1/p' | head -n1 )
-mode=$(uci -q get podkop.main.proxy_config_type)
-echo "==> ${ver:-podkop (версия не определена)}, режим: ${mode:-не задан}"
-if [ "$mode" != urltest ]; then
-  die "podkop работает не в режиме urltest, а скрипт пишет ссылки именно туда (urltest_proxy_links).
-   Переключи в LuCI: Services → Podkop → тип конфигурации прокси → URLTest и запусти установку снова.
-   Если такого пункта нет — podkop слишком старый, сначала обнови его."
-fi
+echo "==> ${ver:-podkop (версия не определена)}"
 
 if ! command -v curl >/dev/null; then
   echo "==> Ставлю curl"
@@ -38,8 +31,19 @@ if ! command -v curl >/dev/null; then
 fi
 
 echo "==> Скачиваю podkop-links-sync"
-curl -fsSL --max-time 30 "$RAW/podkop-links-sync" -o "$BIN.new" && sh -n "$BIN.new" || die "Не удалось скачать"
-mv "$BIN.new" "$BIN" && chmod 755 "$BIN"
+NEWBIN=/tmp/podkop-links-sync.$$
+curl -fsSL --max-time 30 "$RAW/podkop-links-sync" -o "$NEWBIN" || die "Не удалось скачать"
+sh -n "$NEWBIN" || { rm -f "$NEWBIN"; die "Скачанный скрипт повреждён"; }
+
+# режим podkop: urltest — ок; одна ссылка (url) — переключим после проверки ссылок; иначе — стоп, ничего не меняя
+st=$(sh "$NEWBIN" --check-mode); rc=$?
+echo "==> $st"
+case $rc in
+  0) SW="" ;;
+  2) SW="--switch-mode" ;;
+  *) rm -f "$NEWBIN"; die "Установка остановлена, на роутере ничего не изменено." ;;
+esac
+mv "$NEWBIN" "$BIN" && chmod 755 "$BIN"
 
 ask() { # ask <вопрос> <по умолчанию>
   if [ -n "$2" ]; then printf '%s [%s]: ' "$1" "$2" >/dev/tty; else printf '%s: ' "$1" >/dev/tty; fi
@@ -48,7 +52,8 @@ ask() { # ask <вопрос> <по умолчанию>
 
 if [ -z "$E_NAME" ] || [ -z "$GH_TOKEN" ]; then
   cur=$(uci -q get podkop.main.urltest_proxy_links)
-  [ -n "$cur" ] && { echo "Сейчас в podkop:"; for l in $cur; do echo "  #${l##*#}"; done; }
+  [ -n "$cur" ] || cur=$(uci -q get podkop.main.proxy_string)
+  [ -n "$cur" ] && { echo "Сейчас в podkop:"; for l in $cur; do case "$l" in vless://*) echo "  #${l##*#}" ;; esac; done; }
   while :; do
     NAME=$(ask "Имя роутера (Email клиента в 3x-ui, одинаковый на всех серверах)" "$NAME")
     [ -n "$NAME" ] && break; echo "Имя не может быть пустым" >/dev/tty
@@ -67,7 +72,12 @@ umask 077
 printf "NAME='%s'\nGH_REPO='%s'\nGH_TOKEN='%s'\n" "$NAME" "$GH_REPO" "$GH_TOKEN" > "$CONF"
 
 echo "==> Проверка"
-"$BIN" --dry || die "Проверь имя, репозиторий и токен"
+# shellcheck disable=SC2086
+"$BIN" --dry $SW || die "Проверь имя, репозиторий и токен. Режим podkop и ссылки не менялись."
+
+echo "==> Применяю"
+# shellcheck disable=SC2086
+"$BIN" --force $SW || die "Не удалось применить, режим podkop и ссылки не менялись. Лог: logread -e podkop-links"
 
 echo "==> cron: каждые 10 минут"
 crontab -l 2>/dev/null | grep -v podkop-links-sync > /tmp/cron.$$
@@ -75,6 +85,4 @@ echo "*/10 * * * * $BIN" >> /tmp/cron.$$
 crontab /tmp/cron.$$ && rm -f /tmp/cron.$$
 /etc/init.d/cron enable >/dev/null 2>&1; /etc/init.d/cron restart >/dev/null 2>&1
 
-echo "==> Применяю"
-"$BIN"
 echo "✅ Готово. Лог: logread -e podkop-links"

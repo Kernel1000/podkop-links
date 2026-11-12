@@ -1,24 +1,61 @@
 #!/bin/sh
 # podkop-links-sync — забирает ссылки этого роутера из GitHub (routers/<NAME>.txt) и обновляет podkop.
-#   podkop-links-sync          обновить, если в репозитории был новый коммит
-#   podkop-links-sync --force  скачать и сверить, даже если коммит не менялся
-#   podkop-links-sync --dry    только показать, что получено
+#   podkop-links-sync               обновить, если в репозитории был новый коммит
+#   podkop-links-sync --force       скачать и сверить, даже если коммит не менялся
+#   podkop-links-sync --dry         только показать, что получено
+#   podkop-links-sync --switch-mode разрешить переключить podkop из режима одной ссылки (url) в urltest
+#   podkop-links-sync --check-mode  проверить режим podkop: код 0 — urltest, 2 — можно переключить, 1 — нельзя
 # Настройки: /etc/podkop-links.conf (NAME, GH_REPO, GH_TOKEN[, SECTION])
 
 CONF=/etc/podkop-links.conf
 # shellcheck disable=SC1090
-. "$CONF" 2>/dev/null || { echo "Нет $CONF — запусти установщик"; exit 1; }
+[ -f "$CONF" ] && . "$CONF"
 SECTION="${SECTION:-main}"
-OPT="podkop.$SECTION.urltest_proxy_links"
-DRY="" FORCE=""
-for a in "$@"; do case "$a" in --dry) DRY=1 ;; --force) FORCE=1 ;; esac; done
+P="podkop.$SECTION"
+OPT="$P.urltest_proxy_links"
+DRY="" FORCE="" ALLOW_SWITCH="" CHECK=""
+for a in "$@"; do case "$a" in
+  --dry) DRY=1 ;; --force) FORCE=1 ;; --switch-mode) ALLOW_SWITCH=1 ;; --check-mode) CHECK=1 ;;
+esac; done
 STAMP=/tmp/podkop-links.sha   # в RAM: флеш не изнашивается, после перезагрузки — одна полная проверка
 TMP=/tmp/podkop-links.txt
 
 log() { logger -t podkop-links "$*"; if [ -t 1 ]; then echo "$*"; fi; }
 
-MODE=$(uci -q get "podkop.$SECTION.proxy_config_type")
-[ "$MODE" = urltest ] || { log "podkop не в режиме urltest (сейчас: ${MODE:-не задан}) — ссылки не трогаю"; exit 1; }
+# ---------- режим podkop ----------
+MODE=$(uci -q get "$P.proxy_config_type")
+CTYPE=$(uci -q get "$P.connection_type")
+
+supports_urltest() { grep -qs urltest /usr/bin/podkop || grep -rqs urltest /usr/lib/podkop; }
+
+# MODE_ST: ok | switch | <причина, почему нельзя>
+if [ "$MODE" = urltest ]; then MODE_ST=ok
+elif [ "$CTYPE" != proxy ]; then
+  MODE_ST="podkop работает не через прокси-ссылки (тип подключения: ${CTYPE:-не задан}) — эту схему скрипт не трогает"
+elif [ -n "$MODE" ] && [ "$MODE" != url ]; then
+  MODE_ST="podkop в режиме «$MODE» (настроен вручную) — переключи на URLTest сам, если это нужно"
+elif ! supports_urltest; then
+  MODE_ST="podkop слишком старый, режима urltest в нём нет — сначала обнови podkop"
+else MODE_ST=switch
+fi
+
+if [ -n "$CHECK" ]; then
+  case "$MODE_ST" in
+    ok) echo "режим: urltest"; exit 0 ;;
+    switch) echo "режим: ${MODE:-url} → будет переключён на urltest"; exit 2 ;;
+    *) echo "$MODE_ST"; exit 1 ;;
+  esac
+fi
+
+[ -f "$CONF" ] || { echo "Нет $CONF — запусти установщик"; exit 1; }
+SWITCH=""
+case "$MODE_ST" in
+  ok) ;;
+  switch)
+    if [ -n "$ALLOW_SWITCH" ]; then SWITCH=1
+    else log "podkop в режиме одной ссылки — ссылки не трогаю (переключит только установщик)"; exit 1; fi ;;
+  *) log "$MODE_ST — ссылки не трогаю"; exit 1 ;;
+esac
 
 LOCK=/tmp/podkop-links-sync.lock
 mkdir "$LOCK" 2>/dev/null || exit 0
@@ -33,7 +70,7 @@ api() { # api <Accept> <путь> [доп. аргументы curl]
 # 1) Дешёвая проверка: номер последнего коммита. Не изменился — выходим.
 HEAD=$(api application/vnd.github.sha commits/HEAD -f) || { log "GitHub недоступен, оставляю как есть"; exit 1; }
 case "$HEAD" in *[!0-9a-f]*|"") log "GitHub вернул странный ответ, оставляю как есть"; exit 1 ;; esac
-if [ -z "$DRY$FORCE" ] && [ "$HEAD" = "$(cat "$STAMP" 2>/dev/null)" ]; then
+if [ -z "$DRY$FORCE$SWITCH" ] && [ "$HEAD" = "$(cat "$STAMP" 2>/dev/null)" ]; then
   [ -t 1 ] && echo "В репозитории ничего нового"
   exit 0
 fi
@@ -42,8 +79,11 @@ fi
 code=$(api application/vnd.github.raw "contents/routers/$NAME.txt" -o "$TMP" -w '%{http_code}')
 case "$code" in
   200) ;;
-  404) log "в репозитории нет файла для «$NAME», оставляю как есть"; echo "$HEAD" > "$STAMP"; exit 0 ;;
-  *)   log "GitHub ответил ${code:-ошибкой}, оставляю как есть"; exit 1 ;;
+  404)
+    log "в репозитории нет файла для «$NAME», оставляю как есть"
+    [ -n "$DRY$SWITCH" ] && exit 1           # при установке это ошибка: неверное имя
+    echo "$HEAD" > "$STAMP"; exit 0 ;;
+  *) log "GitHub ответил ${code:-ошибкой}, оставляю как есть"; exit 1 ;;
 esac
 
 NEW=$(grep -E '^vless://[^[:space:]]+@[^[:space:]]+$' "$TMP" | tr '\n' ' ' | sed 's/ $//')
@@ -53,20 +93,30 @@ if [ -n "$DRY" ]; then
   show() { for l in "$@"; do echo "  ${l%%\?*}  #${l##*#}"; done | sed 's#vless://[^@]*@#vless://***@#'; }
   # shellcheck disable=SC2086
   { echo "Сейчас в podkop:"; show $CUR; echo "Из GitHub для «$NAME»:"; show $NEW; }
-  if [ "$NEW" = "$CUR" ]; then echo "→ без изменений"; else echo "→ будет обновлено"; fi
+  [ -n "$NEW" ] || { echo "→ в файле нет ссылок"; exit 1; }
+  [ -n "$SWITCH" ] && echo "→ режим podkop будет переключён: ${MODE:-url} → urltest"
+  if [ "$NEW" = "$CUR" ]; then echo "→ ссылки без изменений"; else echo "→ ссылки будут обновлены"; fi
   exit 0
 fi
 
 [ -n "$NEW" ] || { log "в файле «$NAME» нет ссылок — ничего не меняю"; exit 1; }
-if [ "$NEW" = "$CUR" ]; then
+if [ "$NEW" = "$CUR" ] && [ -z "$SWITCH" ]; then
   echo "$HEAD" > "$STAMP"
   [ -t 1 ] && echo "Ссылки этого роутера не изменились"
   exit 0
 fi
 
+# ссылки и (если нужно) режим — одним коммитом: без ссылок режим не переключится никогда
 uci -q delete "$OPT"
 for l in $NEW; do uci add_list "$OPT=$l"; done
+if [ -n "$SWITCH" ]; then
+  uci set "$P.proxy_config_type=urltest"
+  [ -n "$(uci -q get "$P.urltest_check_interval")" ] || uci set "$P.urltest_check_interval=3m"
+  [ -n "$(uci -q get "$P.urltest_tolerance")" ]      || uci set "$P.urltest_tolerance=50"
+  [ -n "$(uci -q get "$P.urltest_testing_url")" ]    || uci set "$P.urltest_testing_url=https://www.gstatic.com/generate_204"
+fi
 uci commit podkop
 /etc/init.d/podkop restart >/dev/null 2>&1
 echo "$HEAD" > "$STAMP"
+[ -n "$SWITCH" ] && log "режим podkop переключён: ${MODE:-url} → urltest (старая ссылка осталась в proxy_string)"
 log "ссылки обновлены ($(echo "$NEW" | wc -w) шт.), podkop перезапущен"
